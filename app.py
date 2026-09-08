@@ -16,7 +16,7 @@ import streamlit as st
 
 from fno_list import get_fno_tickers
 from data_fetch import fetch_universe
-from screeners import run_all_screeners
+from screeners import run_all_screeners, run_diagnostics
 
 st.set_page_config(
     page_title="VPA + HTM Screener",
@@ -29,11 +29,22 @@ st.set_page_config(
 # ---------------------------------------------------------------------------
 st.markdown("""
 <style>
-    .main { background-color: #0e1117; }
-    div[data-testid="stMetricValue"] { font-size: 1.6rem; }
-    .long-badge { color: #16c784; font-weight: 700; }
-    .short-badge { color: #ea3943; font-weight: 700; }
+    .main { background-color: #0b0e14; }
+    div[data-testid="stMetricValue"] { font-size: 1.7rem; }
     .stDataFrame { border-radius: 10px; overflow: hidden; }
+
+    .screener-card {
+        border-radius: 12px;
+        padding: 18px 20px;
+        margin-bottom: 6px;
+        border: 1px solid rgba(255,255,255,0.08);
+    }
+    .card-reversal   { background: linear-gradient(135deg, rgba(168,85,247,0.12), rgba(168,85,247,0.02)); border-left: 4px solid #a855f7; }
+    .card-momentum   { background: linear-gradient(135deg, rgba(56,189,248,0.12), rgba(56,189,248,0.02)); border-left: 4px solid #38bdf8; }
+    .card-swing      { background: linear-gradient(135deg, rgba(34,197,94,0.12), rgba(34,197,94,0.02)); border-left: 4px solid #22c55e; }
+    .card-title { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.06em; opacity: 0.75; margin-bottom: 4px; }
+    .card-count { font-size: 2.1rem; font-weight: 800; line-height: 1.1; }
+    .card-desc  { font-size: 0.82rem; opacity: 0.7; margin-top: 4px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -59,16 +70,16 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 # STATE
 # ---------------------------------------------------------------------------
-if "results" not in st.session_state:
-    st.session_state.results = None
-    st.session_state.scan_time = None
+for key, default in [("results", None), ("diagnostics", None), ("scan_time", None),
+                      ("scanned_count", 0), ("requested_count", 0)]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 # ---------------------------------------------------------------------------
 # RUN SCAN
 # ---------------------------------------------------------------------------
 if run_button:
     tickers = get_fno_tickers(force_refresh=refresh_live_list)[:universe_size]
-
     progress_bar = st.progress(0, text="Starting scan...")
 
     def _progress(done, total):
@@ -78,64 +89,116 @@ if run_button:
         universe = fetch_universe(tickers, max_workers=12, progress_callback=_progress)
 
     progress_bar.progress(1.0, text="Running screeners...")
-    results = run_all_screeners(universe)
+    st.session_state.results = run_all_screeners(universe)
+    st.session_state.diagnostics = run_diagnostics(universe)
     progress_bar.empty()
 
-    st.session_state.results = results
     st.session_state.scan_time = time.strftime("%Y-%m-%d %H:%M:%S")
     st.session_state.scanned_count = len(universe)
     st.session_state.requested_count = len(tickers)
 
+results = st.session_state.results
+diag = st.session_state.diagnostics
+
 # ---------------------------------------------------------------------------
 # TOP METRICS
 # ---------------------------------------------------------------------------
-results = st.session_state.results
-
-col1, col2, col3, col4 = st.columns(4)
-with col1:
-    st.metric("Stocks Requested", st.session_state.get("requested_count", 0))
-with col2:
-    st.metric("Passed Liquidity Filter", st.session_state.get("scanned_count", 0))
-with col3:
-    st.metric("Setups Found", 0 if results is None else len(results))
-with col4:
+mcol1, mcol2, mcol3 = st.columns(3)
+with mcol1:
+    st.metric("Stocks Requested", st.session_state.requested_count)
+with mcol2:
+    st.metric("Passed Liquidity Filter", st.session_state.scanned_count)
+with mcol3:
     st.metric("Last Scan", st.session_state.scan_time or "—")
+
+st.write("")
+
+
+def _count(screener_prefix: str) -> int:
+    if results is None or results.empty:
+        return 0
+    return int(results["Screener"].str.startswith(screener_prefix).sum())
+
+
+c1, c2, c3 = st.columns(3)
+with c1:
+    st.markdown(f"""<div class="screener-card card-reversal">
+        <div class="card-title">🔄 Reversal</div>
+        <div class="card-count">{_count("Screener 1")}</div>
+        <div class="card-desc">Stopping-volume candle at support/resistance, HTM-confirmed</div>
+    </div>""", unsafe_allow_html=True)
+with c2:
+    st.markdown(f"""<div class="screener-card card-momentum">
+        <div class="card-title">⚡ Intraday Momentum</div>
+        <div class="card-count">{_count("Screener 2")}</div>
+        <div class="card-desc">Trend-following breakout above/below yesterday's range</div>
+    </div>""", unsafe_allow_html=True)
+with c3:
+    st.markdown(f"""<div class="screener-card card-swing">
+        <div class="card-title">📊 Swing Trend</div>
+        <div class="card-count">{_count("Screener 3")}</div>
+        <div class="card-desc">Stage-2 trend alignment + pullback / base-breakout trigger</div>
+    </div>""", unsafe_allow_html=True)
 
 st.divider()
 
 # ---------------------------------------------------------------------------
-# RESULTS
+# HELPERS
 # ---------------------------------------------------------------------------
-if results is None:
-    st.info("👈 Set your scan size in the sidebar and click **Run Scan Now** to begin.")
-elif results.empty:
-    st.warning("No setups matched any screener in this scan. Try again after the next candle close, "
-               "or widen the universe size.")
-else:
-    tab1, tab2, tab3, tab_all = st.tabs([
-        "🔄 Reversal", "⚡ Intraday Momentum", "📊 Swing", "📋 All Results"
-    ])
+def _style_direction(df: pd.DataFrame):
+    if "Direction" not in df.columns:
+        return df
+    return df.style.map(
+        lambda v: "color: #16c784; font-weight: 700" if v == "Long"
+        else ("color: #ea3943; font-weight: 700" if v == "Short" else ""),
+        subset=["Direction"],
+    )
 
-    def _style_direction(df: pd.DataFrame):
-        return df.style.applymap(
-            lambda v: "color: #16c784; font-weight: 700" if v == "Long"
-            else ("color: #ea3943; font-weight: 700" if v == "Short" else ""),
-            subset=["Direction"],
-        )
 
-    with tab1:
-        sub = results[results["Screener"].str.startswith("Screener 1")]
-        st.dataframe(_style_direction(sub) if not sub.empty else sub, use_container_width=True, hide_index=True)
+def _render_screener_tab(screener_prefix: str, label: str, diag_key: str, explainer: str):
+    sub = pd.DataFrame() if results is None else results[results["Screener"].str.startswith(screener_prefix)]
 
-    with tab2:
-        sub = results[results["Screener"].str.startswith("Screener 2")]
-        st.dataframe(_style_direction(sub) if not sub.empty else sub, use_container_width=True, hide_index=True)
+    if results is None:
+        st.info("👈 Run a scan from the sidebar to see results here.")
+        return
 
-    with tab3:
-        sub = results[results["Screener"].str.startswith("Screener 3")]
-        st.dataframe(_style_direction(sub) if not sub.empty else sub, use_container_width=True, hide_index=True)
+    if not sub.empty:
+        st.dataframe(_style_direction(sub), use_container_width=True, hide_index=True)
+    else:
+        st.warning(f"No **{label}** setups fired in this scan. {explainer}")
 
-    with tab_all:
+    d = None if diag is None else diag.get(diag_key)
+    if d is not None and not d.empty:
+        with st.expander(f"🔎 See closest near-misses for {label} (diagnostic view — not a bug checker, just transparency)"):
+            st.caption("Each check shows whether that specific condition was true for this stock at scan time. "
+                       "A stock needs (almost) all checks true to fire — this shows how close each stock got.")
+            st.dataframe(d.head(15), use_container_width=True, hide_index=True)
+
+
+# ---------------------------------------------------------------------------
+# TABS — always visible, regardless of scan outcome
+# ---------------------------------------------------------------------------
+tab1, tab2, tab3, tab_all = st.tabs([
+    "🔄 Reversal", "⚡ Intraday Momentum", "📊 Swing", "📋 All Results"
+])
+
+with tab1:
+    _render_screener_tab("Screener 1", "Reversal", "Reversal",
+                          "This needs an HTM cross to happen on the *current* candle, right at a support/resistance level — a rare, precise alignment.")
+with tab2:
+    _render_screener_tab("Screener 2", "Intraday Momentum", "Intraday Momentum",
+                          "This needs the daily trend, volume, HTM, and a breakout of yesterday's range to all align *today*.")
+with tab3:
+    _render_screener_tab("Screener 3", "Swing", "Swing",
+                          "This needs 4 moving averages stacked and rising together, above the yearly VWAP — a strict 'healthy uptrend' filter.")
+
+with tab_all:
+    if results is None:
+        st.info("👈 Run a scan from the sidebar to see results here.")
+    elif results.empty:
+        st.warning("No setups matched any screener in this scan. Check the near-miss tables in each tab above, "
+                   "or try again after the next candle close / widen the universe size.")
+    else:
         st.dataframe(_style_direction(results), use_container_width=True, hide_index=True)
         csv = results.to_csv(index=False).encode("utf-8")
         st.download_button("⬇️ Download CSV", csv, "nse_screener_results.csv", "text/csv",

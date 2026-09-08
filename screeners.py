@@ -256,6 +256,132 @@ def screener_swing(ticker: str, data: dict) -> list[dict]:
     return hits
 
 
+# ---------------------------------------------------------------------------
+# DIAGNOSTICS — "how close did this stock get?" for each screener.
+# This exists so a 0-result scan can be checked, not just trusted blindly.
+# ---------------------------------------------------------------------------
+def diagnose_swing(ticker: str, data: dict) -> dict | None:
+    daily = data["daily"]
+    if daily is None or len(daily) < 210:
+        return None
+    d = daily.copy()
+    d["EMA20"] = d["Close"].ewm(span=20, adjust=False).mean()
+    d["SMA50"] = d["Close"].rolling(50).mean()
+    d["SMA100"] = d["Close"].rolling(100).mean()
+    d["SMA200"] = d["Close"].rolling(200).mean()
+    price = d["Close"].iloc[-1]
+    ema20, ema20_prev = d["EMA20"].iloc[-1], d["EMA20"].iloc[-6]
+    sma50, sma50_prev = d["SMA50"].iloc[-1], d["SMA50"].iloc[-6]
+    sma100, sma100_prev = d["SMA100"].iloc[-1], d["SMA100"].iloc[-6]
+    sma200, sma200_prev = d["SMA200"].iloc[-1], d["SMA200"].iloc[-6]
+    if any(pd.isna(x) for x in [ema20, sma50, sma100, sma200]):
+        return None
+
+    ytd_start = f"{d.index[-1].year}-01-01"
+    ytd_avwap = ind.anchored_vwap(d, ytd_start).iloc[-1]
+
+    conditions = {
+        "Price > 20 EMA": price > ema20,
+        "20 EMA > 50 SMA": ema20 > sma50,
+        "50 SMA > 100 SMA": sma50 > sma100,
+        "100 SMA > 200 SMA": sma100 > sma200,
+        "All 4 MAs sloped up (5d)": (ema20 > ema20_prev and sma50 > sma50_prev
+                                     and sma100 > sma100_prev and sma200 > sma200_prev),
+        "Above YTD Anchored VWAP": (not pd.isna(ytd_avwap)) and price > ytd_avwap,
+    }
+    score = sum(conditions.values())
+    return {"Symbol": ticker.replace(".NS", ""), "LTP": round(price, 2),
+            "Score": f"{score}/{len(conditions)}", "_score": score, "_total": len(conditions),
+            **{k: ("✅" if v else "❌") for k, v in conditions.items()}}
+
+
+def diagnose_momentum(ticker: str, data: dict) -> dict | None:
+    daily, m75 = data["daily"], data["m75"]
+    if daily is None or m75 is None or len(daily) < 25 or len(m75) < 25:
+        return None
+    d = daily.copy()
+    d["SMA5"] = d["Close"].rolling(5).mean()
+    d["SMA20"] = d["Close"].rolling(20).mean()
+    price = d["Close"].iloc[-1]
+    sma5, sma5_prev = d["SMA5"].iloc[-1], d["SMA5"].iloc[-2]
+    sma20, sma20_prev = d["SMA20"].iloc[-1], d["SMA20"].iloc[-2]
+    if pd.isna(sma5) or pd.isna(sma20):
+        return None
+    htm75 = ind.htm_indicator(m75)
+    if htm75.empty:
+        return None
+    rsi75 = htm75["rsi9"].iloc[-1]
+    gap75, gap75_prev = htm75["gap"].iloc[-1], htm75["gap"].iloc[-2]
+    yesterday_high = d["High"].iloc[-2]
+
+    conditions_long = {
+        "Price>SMA5>SMA20": price > sma5 > sma20,
+        "SMA5 & SMA20 rising": sma5 > sma5_prev and sma20 > sma20_prev,
+        "Volume rising": d["Volume"].iloc[-1] > d["Volume"].iloc[-5:-1].mean(),
+        "75m RSI > 50": rsi75 > 50,
+        "HTM gap positive & widening": gap75 > 0 and gap75 > gap75_prev,
+        "Broke yesterday's High": price > yesterday_high,
+    }
+    score = sum(conditions_long.values())
+    return {"Symbol": ticker.replace(".NS", ""), "LTP": round(price, 2),
+            "Score": f"{score}/{len(conditions_long)}", "_score": score, "_total": len(conditions_long),
+            **{k: ("✅" if v else "❌") for k, v in conditions_long.items()}}
+
+
+def diagnose_reversal(ticker: str, data: dict) -> dict | None:
+    daily, m75 = data["daily"], data["m75"]
+    intraday = data["m15"] if data["m15"] is not None and not data["m15"].empty else data["m5"]
+    if daily is None or m75 is None or intraday is None or len(m75) < 25 or len(intraday) < 5:
+        return None
+    htm75 = ind.htm_indicator(m75)
+    if htm75.empty or htm75["rsi9"].isna().all():
+        return None
+    last_price = intraday["Close"].iloc[-1]
+    last_rsi75 = htm75["rsi9"].iloc[-1]
+    candle_label = ind.classify_candle(intraday, len(intraday) - 1)
+    swing_low = _swing_low(daily)
+    nearest_support_dist = abs(last_price - swing_low) / swing_low if swing_low and not pd.isna(swing_low) else np.nan
+
+    conditions = {
+        "Candle is a reversal shape": candle_label != "-",
+        "75m RSI < 30 (oversold) or > 70 (overbought)": (last_rsi75 < 30 or last_rsi75 > 70),
+        "HTM lines just crossed & widening": (ind.htm_bullish_cross_widening(htm75)
+                                               or ind.htm_bearish_cross_widening(htm75)),
+        "Within 0.5% of a support/resistance level": (not pd.isna(nearest_support_dist)
+                                                        and nearest_support_dist <= 0.005),
+    }
+    score = sum(conditions.values())
+    return {"Symbol": ticker.replace(".NS", ""), "LTP": round(last_price, 2),
+            "Score": f"{score}/{len(conditions)}", "_score": score, "_total": len(conditions),
+            **{k: ("✅" if v else "❌") for k, v in conditions.items()}}
+
+
+def run_diagnostics(universe: dict[str, dict]) -> dict[str, pd.DataFrame]:
+    """Returns {'Reversal': df, 'Intraday Momentum': df, 'Swing': df}, each
+    sorted by score descending -- the stocks that came CLOSEST to firing."""
+    rows = {"Reversal": [], "Intraday Momentum": [], "Swing": []}
+    for ticker, data in universe.items():
+        try:
+            r = diagnose_reversal(ticker, data)
+            if r:
+                rows["Reversal"].append(r)
+            m = diagnose_momentum(ticker, data)
+            if m:
+                rows["Intraday Momentum"].append(m)
+            s = diagnose_swing(ticker, data)
+            if s:
+                rows["Swing"].append(s)
+        except Exception:
+            continue
+    out = {}
+    for name, lst in rows.items():
+        df = pd.DataFrame(lst)
+        if not df.empty:
+            df = df.sort_values("_score", ascending=False).drop(columns=["_score", "_total"])
+        out[name] = df
+    return out
+
+
 def run_all_screeners(universe: dict[str, dict]) -> pd.DataFrame:
     """universe = {ticker: data_dict} from data_fetch.fetch_universe()."""
     all_hits = []
