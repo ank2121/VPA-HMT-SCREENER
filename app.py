@@ -155,6 +155,15 @@ def _style_direction(df: pd.DataFrame):
     )
 
 
+def _near_miss_expander(label: str, diag_key: str):
+    d = None if diag is None else diag.get(diag_key)
+    if d is not None and not d.empty:
+        with st.expander(f"🔎 See closest near-misses for {label} (diagnostic view — not a bug checker, just transparency)"):
+            st.caption("Each check shows whether that specific condition was true for this stock at scan time. "
+                       "A stock needs (almost) all checks true to fire — this shows how close each stock got.")
+            st.dataframe(d.head(15), use_container_width=True, hide_index=True)
+
+
 def _render_screener_tab(screener_prefix: str, label: str, diag_key: str, explainer: str):
     sub = pd.DataFrame() if results is None else results[results["Screener"].str.startswith(screener_prefix)]
 
@@ -167,12 +176,49 @@ def _render_screener_tab(screener_prefix: str, label: str, diag_key: str, explai
     else:
         st.warning(f"No **{label}** setups fired in this scan. {explainer}")
 
-    d = None if diag is None else diag.get(diag_key)
-    if d is not None and not d.empty:
-        with st.expander(f"🔎 See closest near-misses for {label} (diagnostic view — not a bug checker, just transparency)"):
-            st.caption("Each check shows whether that specific condition was true for this stock at scan time. "
-                       "A stock needs (almost) all checks true to fire — this shows how close each stock got.")
-            st.dataframe(d.head(15), use_container_width=True, hide_index=True)
+    _near_miss_expander(label, diag_key)
+
+
+def _render_reversal_tab():
+    """Reversal gets a special side-by-side layout: Intraday-level setups
+    (near a recent swing high/low) vs Swing/Pivot-level setups (near a
+    Daily or Weekly pivot S/R) — shown as two slick columns."""
+    if results is None:
+        st.info("👈 Run a scan from the sidebar to see results here.")
+        return
+
+    sub = results[results["Screener"].str.startswith("Screener 1")]
+    intraday_sub = sub[sub.get("Level Type") == "Intraday Swing Level"] if not sub.empty else sub
+    swing_sub = sub[sub.get("Level Type") == "Daily/Weekly Pivot"] if not sub.empty else sub
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("""<div class="screener-card card-momentum" style="margin-bottom:10px;">
+            <div class="card-title">🕐 Intraday-Level Reversals</div>
+            <div class="card-desc">Reversal near a recent 20-bar swing high/low</div>
+        </div>""", unsafe_allow_html=True)
+        if not intraday_sub.empty:
+            st.dataframe(_style_direction(intraday_sub.drop(columns=["Level Type"])),
+                         use_container_width=True, hide_index=True)
+        else:
+            st.caption("No intraday-level reversal setups fired.")
+
+    with right:
+        st.markdown("""<div class="screener-card card-swing" style="margin-bottom:10px;">
+            <div class="card-title">📐 Swing / Pivot-Level Reversals</div>
+            <div class="card-desc">Reversal near a Daily or Weekly Pivot S/R</div>
+        </div>""", unsafe_allow_html=True)
+        if not swing_sub.empty:
+            st.dataframe(_style_direction(swing_sub.drop(columns=["Level Type"])),
+                         use_container_width=True, hide_index=True)
+        else:
+            st.caption("No swing/pivot-level reversal setups fired.")
+
+    if sub.empty:
+        st.warning("No **Reversal** setups fired in this scan. This needs an HTM cross to happen on the "
+                   "*current* candle, right at a support/resistance level — a rare, precise alignment.")
+
+    _near_miss_expander("Reversal", "Reversal")
 
 
 # ---------------------------------------------------------------------------
@@ -183,8 +229,7 @@ tab1, tab2, tab3, tab_all = st.tabs([
 ])
 
 with tab1:
-    _render_screener_tab("Screener 1", "Reversal", "Reversal",
-                          "This needs an HTM cross to happen on the *current* candle, right at a support/resistance level — a rare, precise alignment.")
+    _render_reversal_tab()
 with tab2:
     _render_screener_tab("Screener 2", "Intraday Momentum", "Intraday Momentum",
                           "This needs the daily trend, volume, HTM, and a breakout of yesterday's range to all align *today*.")

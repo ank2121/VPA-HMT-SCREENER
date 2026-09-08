@@ -66,6 +66,12 @@ def screener_reversal(ticker: str, data: dict) -> list[dict]:
     bullish_candle = candle_label in ("Hammer", "Doji", "Bullish Engulfing", "Stopping Volume (Bullish)")
     bearish_candle = candle_label in ("Shooting Star", "Doji", "Bearish Engulfing", "Stopping Volume (Bearish)")
 
+    signal_time = intraday.index[-1]
+    timeframe_label = "15m" if data["m15"] is not None and not data["m15"].empty else "5m"
+
+    def _level_type(level_name: str) -> str:
+        return "Intraday Swing Level" if level_name.startswith("Swing ") else "Daily/Weekly Pivot"
+
     # Bullish reversal
     if bullish_candle and last_rsi75 < 30 and ind.htm_bullish_cross_widening(htm75):
         for name, level in support_levels.items():
@@ -76,9 +82,12 @@ def screener_reversal(ticker: str, data: dict) -> list[dict]:
                     "Direction": "Long",
                     "LTP": round(last_price, 2),
                     "Key Level": name,
+                    "Level Type": _level_type(name),
                     "Candle": candle_label,
-                    "HTM RSI (75m)": round(last_rsi75, 1),
+                    "HTM RSI (75m)": f"{last_rsi75:.1f}",
                     "HTM Signal": "Bullish cross, widening",
+                    "Signal Time": signal_time.strftime("%Y-%m-%d %H:%M"),
+                    "Timeframe": timeframe_label,
                 })
                 break
 
@@ -92,9 +101,12 @@ def screener_reversal(ticker: str, data: dict) -> list[dict]:
                     "Direction": "Short",
                     "LTP": round(last_price, 2),
                     "Key Level": name,
+                    "Level Type": _level_type(name),
                     "Candle": candle_label,
-                    "HTM RSI (75m)": round(last_rsi75, 1),
+                    "HTM RSI (75m)": f"{last_rsi75:.1f}",
                     "HTM Signal": "Bearish cross, widening",
+                    "Signal Time": signal_time.strftime("%Y-%m-%d %H:%M"),
+                    "Timeframe": timeframe_label,
                 })
                 break
 
@@ -129,6 +141,7 @@ def screener_intraday_momentum(ticker: str, data: dict) -> list[dict]:
         return hits
     rsi75 = htm75["rsi9"].iloc[-1]
     gap75, gap75_prev = htm75["gap"].iloc[-1], htm75["gap"].iloc[-2]
+    signal_time = m75.index[-1]
 
     # Long
     if (price > sma5 > sma20 and sma5 > sma5_prev and sma20 > sma20_prev
@@ -141,8 +154,10 @@ def screener_intraday_momentum(ticker: str, data: dict) -> list[dict]:
             "LTP": round(price, 2),
             "Key Level": "Broke Yesterday's High",
             "Candle": "-",
-            "HTM RSI (75m)": round(rsi75, 1),
+            "HTM RSI (75m)": f"{rsi75:.1f}",
             "HTM Signal": "Bullish, gap widening",
+            "Signal Time": signal_time.strftime("%Y-%m-%d %H:%M"),
+            "Timeframe": "75m (Daily trend confirmed)",
         })
 
     # Short
@@ -156,8 +171,10 @@ def screener_intraday_momentum(ticker: str, data: dict) -> list[dict]:
             "LTP": round(price, 2),
             "Key Level": "Broke Yesterday's Low",
             "Candle": "-",
-            "HTM RSI (75m)": round(rsi75, 1),
+            "HTM RSI (75m)": f"{rsi75:.1f}",
             "HTM Signal": "Bearish, gap widening",
+            "Signal Time": signal_time.strftime("%Y-%m-%d %H:%M"),
+            "Timeframe": "75m (Daily trend confirmed)",
         })
 
     return hits
@@ -223,6 +240,8 @@ def screener_swing(ticker: str, data: dict) -> list[dict]:
             "Candle": "-",
             "HTM RSI (75m)": "-",
             "HTM Signal": "75m Volume Line < 50, Price crossed RSI",
+            "Signal Time": d.index[-1].strftime("%Y-%m-%d"),
+            "Timeframe": "Daily",
         })
 
     # --- Trigger B: Base breakout on volume surge ---
@@ -251,6 +270,8 @@ def screener_swing(ticker: str, data: dict) -> list[dict]:
             "Candle": "-",
             "HTM RSI (75m)": "-",
             "HTM Signal": f"Volume {round(d['Volume'].iloc[-1] / vol_sma20, 1)}x avg",
+            "Signal Time": d.index[-1].strftime("%Y-%m-%d"),
+            "Timeframe": "Daily",
         })
 
     return hits
@@ -394,7 +415,7 @@ def run_all_screeners(universe: dict[str, dict]) -> pd.DataFrame:
             continue  # never let one bad ticker crash the whole scan
     if not all_hits:
         return pd.DataFrame(columns=[
-            "Symbol", "Screener", "Direction", "LTP", "Key Level",
-            "Candle", "HTM RSI (75m)", "HTM Signal",
+            "Symbol", "Screener", "Direction", "LTP", "Key Level", "Level Type",
+            "Candle", "HTM RSI (75m)", "HTM Signal", "Signal Time", "Timeframe",
         ])
     return pd.DataFrame(all_hits)
